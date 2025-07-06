@@ -1,6 +1,5 @@
 import random
 import threading
-import time
 import warnings
 from dataclasses import asdict, dataclass
 from itertools import islice
@@ -8,14 +7,12 @@ from queue import Queue
 from typing import (
     Any,
     Callable,
-    Deque,
     Dict,
     Generator,
     Iterable,
     List,
     Literal,
     Optional,
-    Sequence,
     Tuple,
     Union,
 )
@@ -36,6 +33,8 @@ from lhotse.dataset.sampling.base import (
 from lhotse.dataset.sampling.dynamic import DurationBatcher, Filter, check_constraint
 from lhotse.utils import ifnone
 
+NUM_PRODUCERS = 16
+PREFETCH_BATCH_SIZE = 8
 
 class DynamicBucketingSampler(CutSampler):
     """
@@ -545,6 +544,8 @@ class DynamicBucketer:
         self.bucket_rng = bucket_rng
         self.shuffle = shuffle
         self.concurrent = concurrent
+        self.num_producers = max(1, NUM_PRODUCERS) 
+        self.prefetch_batch_size = max(1, PREFETCH_BATCH_SIZE)
 
         assert duration_bins == sorted(duration_bins), (
             f"Argument list for 'duration_bins' is expected to be in "
@@ -575,14 +576,23 @@ class DynamicBucketer:
         # Init: create empty buckets (note: `num_buckets = len(duration_bins) + 1`).
         self.buckets: List[Queue] = [Queue() for _ in range(len(duration_bins) + 1)]
 
-        self._producer_thread = None
+        # --- Concurrency helpers ---
+        self._iter_lock = threading.Lock()           # guards `next(self.cuts_iter)`
+        self._not_full = threading.Condition()        # signals “buffer has room”
+        self._stop_event = threading.Event()          # global shutdown flag
+        self._producers: List[threading.Thread] = []  # pool
+        self._source_exhausted = False
 
     def __iter__(self) -> Generator[CutSet, None, None]:
         # Init: sample `buffer_size` cuts and assign them to the right buckets.
         self.cuts_iter = iter(self.cuts)
 
+        # Clean up any surviving producers from a previous epoch
+        self._shutdown_producers()
+        self._stop_event.clear()
+
         if self.concurrent:
-            self._start_data_producer_thread()
+            self._start_data_producer_threads()
             self._maybe_wait_for_producer()
         else:
             self._collect_cuts_in_buckets(self.buffer_size)
@@ -634,11 +644,16 @@ class DynamicBucketer:
                         sampling_bucket.get()
                 # Fetch new cuts and add them to appropriate buckets.
                 if self.concurrent:
+                    with self._not_full:
+                        self._not_full.notify_all()
+
                     self._maybe_wait_for_producer()
                 else:
                     self._collect_cuts_in_buckets(batch_size)
         except StopIteration:
-            pass
+            # check whether producer thread is still alive and join it before iter ends
+            # in case StopIteration is raised somewhere outside the producer
+            self._shutdown_producers()
 
         # Cleanup.
         self.cuts_iter = None
@@ -731,35 +746,72 @@ class DynamicBucketer:
                 return True
         return False
 
-    def _start_data_producer_thread(self):
-        """Start concurrent filling of the bucket buffer in a background thread."""
+    def _start_data_producer_threads(self):
+        """Spin up `self.num_producers` producer threads (thread-pool)."""
+        for idx in range(self.num_producers):
+            t = threading.Thread(
+                target=self._producer_loop,
+                name=f"DynamicBucketerProducer-{idx}",
+                daemon=True,
+            )
+            t.start()
+            self._producers.append(t)
 
-        def producer():
-            try:
-                self._source_exhausted = False
-                while not self._source_exhausted:
-                    if sum(b.qsize() for b in self.buckets) == self.buffer_size:
-                        time.sleep(0.1)
-                        continue
-                    cuts = next(self.cuts_iter)
+    def _producer_loop(self):
+        """
+        Shared worker function for the thread-pool:
+        * Pulls up to `prefetch_batch_size` cuts under an iterator lock
+        * Uses a condition variable instead of busy-sleep when buffer is full
+        """
+        try:
+            while not self._stop_event.is_set():
+                batch: List[Union[Cut, Tuple[Cut]]] = []
+                # --- Pull from the shared iterator (thread-safe) ---
+                with self._iter_lock:
+                    for _ in range(self.prefetch_batch_size):
+                        if self._stop_event.is_set():
+                            break
+                        try:
+                            batch.append(next(self.cuts_iter))
+                        except StopIteration:
+                            self._stop_event.set()
+                            break
+                if not batch:
+                    break
+
+                for cuts in batch:
+                    # --- Wait for space in the global buffer ---
+                    with self._not_full:
+                        while (
+                            sum(b.qsize() for b in self.buckets) >= self.buffer_size
+                            and not self._stop_event.is_set()
+                        ):
+                            self._not_full.wait(timeout=0.1)
+
                     bucket_idx = self.constraint.select_bucket(
                         buckets=self.duration_bins,
                         example=cuts[0] if isinstance(cuts, tuple) else cuts,
                     )
                     self.buckets[bucket_idx].put(cuts)
-            except StopIteration:
-                self._source_exhausted = True
 
-        self._producer_thread = threading.Thread(target=producer)
-        self._producer_thread.start()
+                    # Wake up consumer waiting on `_maybe_wait_for_producer`
+                    with self._not_full:
+                        self._not_full.notify_all()
+        finally:
+            # Ensure consumer isn’t left hanging on exit
+            with self._not_full:
+                self._not_full.notify_all()
+            self._source_exhausted = True
 
     def _maybe_wait_for_producer(self):
-        """Triggers wait for producer if the bucket buffers are less than 10% utilized."""
-        while (
-            sum(b.qsize() for b in self.buckets) < self.buffer_size / 10
-            and not self._source_exhausted
-        ):
-            time.sleep(1.0)
+        """Block until ≥10 % of the buffer is filled or the source is exhausted."""
+        with self._not_full:
+            while (
+                sum(b.qsize() for b in self.buckets) < self.buffer_size / 10
+                and not self._source_exhausted
+            ):
+                # Wait is interrupted whenever producers notify or on timeout
+                self._not_full.wait(timeout=0.5)
 
     def _collect_cuts_in_buckets(self, n_cuts: int) -> None:
         """Fetches ``n_cuts`` from the input data iterable. Doesn't use concurrency."""
@@ -774,14 +826,16 @@ class DynamicBucketer:
         except StopIteration:
             pass
 
+    def _shutdown_producers(self):
+        """Idempotent; safe to call multiple times."""
+        self._stop_event.set()
+        for t in self._producers:
+            if t.is_alive():
+                t.join()
+        self._producers.clear()
+
     def __del__(self):
-        if (
-            self.concurrent
-            and self._producer_thread is not None
-            and self._producer_thread.is_alive()
-        ):
-            self._source_exhausted = True
-            self._producer_thread.join()
+        self._shutdown_producers()
 
 
 def pick_at_random(
