@@ -33,8 +33,8 @@ from lhotse.dataset.sampling.base import (
 from lhotse.dataset.sampling.dynamic import DurationBatcher, Filter, check_constraint
 from lhotse.utils import ifnone
 
-NUM_PRODUCERS = 16
-PREFETCH_BATCH_SIZE = 8
+NUM_PRODUCERS = 32
+PREFETCH_BATCH_SIZE = 32
 
 class DynamicBucketingSampler(CutSampler):
     """
